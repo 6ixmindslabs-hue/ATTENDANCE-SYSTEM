@@ -66,3 +66,28 @@ FRONTEND_ORIGINS=https://your-vercel-app.vercel.app,http://localhost:5173,http:/
 ```
 
 Then redeploy the Render backend.
+
+## Hugging Face Backend Alternative
+
+The backend can also run on Hugging Face Spaces with Docker.
+
+Use the included root files:
+
+- `Dockerfile`
+- `.dockerignore`
+- `README.md`
+- `HUGGINGFACE_DEPLOYMENT.md`
+
+Create a Hugging Face Space with SDK `Docker`, then add the same backend environment variables as Space secrets.
+
+The backend URL will look like:
+
+```text
+https://your-username-attendance-system-api.hf.space
+```
+
+If you use Hugging Face instead of Render, set this in Vercel:
+
+```env
+VITE_API_URL=https://your-username-attendance-system-api.hf.space
+```
