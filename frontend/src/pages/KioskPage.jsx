@@ -594,7 +594,7 @@ export function KioskPage({ token, onUnauthorized }) {
           stableDetectionsRef.current = 0;
           if (!processingRef.current) {
             setStage('ready');
-            setStatusText('Move inside the scan box');
+            setStatusText('Move to the center');
           }
           return;
         }

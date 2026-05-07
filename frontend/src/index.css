@@ -1893,33 +1893,15 @@ button {
   width: var(--kiosk-frame-width);
   height: var(--kiosk-frame-height);
   transform: translate(-50%, -50%);
-  border: 2px solid rgba(226, 232, 240, 0.88);
+  border: none;
   border-radius: 24px;
   pointer-events: none;
-  box-shadow:
-    0 0 0 1px rgba(255, 255, 255, 0.12) inset,
-    0 0 0 999px rgba(2, 6, 23, 0.02),
-    0 22px 64px rgba(0, 0, 0, 0.28);
+  box-shadow: none;
 }
 
 .kiosk-scan-frame::before,
 .kiosk-scan-frame::after {
-  content: '';
-  position: absolute;
-  left: 50%;
-  width: min(42%, 160px);
-  height: 2px;
-  transform: translateX(-50%);
-  border-radius: 999px;
-  background: rgba(248, 250, 252, 0.86);
-}
-
-.kiosk-scan-frame::before {
-  top: -2px;
-}
-
-.kiosk-scan-frame::after {
-  bottom: -2px;
+  display: none;
 }
 
 .kiosk-face-box {
