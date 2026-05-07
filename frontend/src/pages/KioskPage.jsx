@@ -10,6 +10,7 @@ const DETECTION_INTERVAL_MS = 120;
 const RECOGNITION_COOLDOWN_MS = 1200;
 const MIN_STABLE_DETECTIONS = 2;
 const MAX_MISSED_DETECTIONS = 4;
+const MIN_FACE_INSIDE_SCAN_RATIO = 0.62;
 
 const STAGE_MAP = {
   booting: {
@@ -122,9 +123,96 @@ function mapBoundingBoxToViewport(boundingBox, videoElement) {
   };
 }
 
+function getScanFrameViewportBox(videoElement, scanFrameElement) {
+  if (!videoElement || !scanFrameElement) {
+    return null;
+  }
+
+  const videoViewport = videoElement.getBoundingClientRect();
+  const scanViewport = scanFrameElement.getBoundingClientRect();
+
+  const left = Math.max(0, Math.min(videoViewport.width, scanViewport.left - videoViewport.left));
+  const top = Math.max(0, Math.min(videoViewport.height, scanViewport.top - videoViewport.top));
+  const right = Math.max(0, Math.min(videoViewport.width, scanViewport.right - videoViewport.left));
+  const bottom = Math.max(0, Math.min(videoViewport.height, scanViewport.bottom - videoViewport.top));
+  const width = Math.max(0, right - left);
+  const height = Math.max(0, bottom - top);
+
+  if (width < 80 || height < 80) {
+    return null;
+  }
+
+  return { left, top, width, height };
+}
+
+function getIntersectionArea(firstBox, secondBox) {
+  const left = Math.max(firstBox.left, secondBox.left);
+  const top = Math.max(firstBox.top, secondBox.top);
+  const right = Math.min(firstBox.left + firstBox.width, secondBox.left + secondBox.width);
+  const bottom = Math.min(firstBox.top + firstBox.height, secondBox.top + secondBox.height);
+
+  return Math.max(0, right - left) * Math.max(0, bottom - top);
+}
+
+function isFaceInsideScanFrame(faceBox, scanBox) {
+  if (!faceBox || !scanBox || faceBox.width <= 0 || faceBox.height <= 0) {
+    return false;
+  }
+
+  const centerX = faceBox.left + faceBox.width / 2;
+  const centerY = faceBox.top + faceBox.height / 2;
+  const centerInside =
+    centerX >= scanBox.left
+    && centerX <= scanBox.left + scanBox.width
+    && centerY >= scanBox.top
+    && centerY <= scanBox.top + scanBox.height;
+
+  if (!centerInside) {
+    return false;
+  }
+
+  const faceArea = faceBox.width * faceBox.height;
+  const visibleFaceRatio = getIntersectionArea(faceBox, scanBox) / faceArea;
+  return visibleFaceRatio >= MIN_FACE_INSIDE_SCAN_RATIO;
+}
+
+function mapViewportBoxToVideoCrop(viewportBox, videoElement) {
+  if (!viewportBox || !videoElement?.videoWidth || !videoElement?.videoHeight) {
+    return null;
+  }
+
+  const viewport = videoElement.getBoundingClientRect();
+  const videoWidth = videoElement.videoWidth;
+  const videoHeight = videoElement.videoHeight;
+  const scale = Math.max(viewport.width / videoWidth, viewport.height / videoHeight);
+  const renderedWidth = videoWidth * scale;
+  const renderedHeight = videoHeight * scale;
+  const offsetX = (viewport.width - renderedWidth) / 2;
+  const offsetY = (viewport.height - renderedHeight) / 2;
+
+  const sourceLeft = Math.max(0, Math.min(videoWidth, (viewportBox.left - offsetX) / scale));
+  const sourceTop = Math.max(0, Math.min(videoHeight, (viewportBox.top - offsetY) / scale));
+  const sourceRight = Math.max(0, Math.min(videoWidth, (viewportBox.left + viewportBox.width - offsetX) / scale));
+  const sourceBottom = Math.max(0, Math.min(videoHeight, (viewportBox.top + viewportBox.height - offsetY) / scale));
+  const sourceWidth = Math.max(0, sourceRight - sourceLeft);
+  const sourceHeight = Math.max(0, sourceBottom - sourceTop);
+
+  if (sourceWidth < 80 || sourceHeight < 80) {
+    return null;
+  }
+
+  return {
+    sourceLeft: Math.round(sourceLeft),
+    sourceTop: Math.round(sourceTop),
+    sourceWidth: Math.round(sourceWidth),
+    sourceHeight: Math.round(sourceHeight),
+  };
+}
+
 export function KioskPage({ token, onUnauthorized }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
+  const scanFrameRef = useRef(null);
   const streamRef = useRef(null);
   const detectorRef = useRef(null);
   const processingRef = useRef(false);
@@ -305,10 +393,30 @@ export function KioskPage({ token, onUnauthorized }) {
     }
 
     const canvas = canvasRef.current;
-    canvas.width = video.videoWidth || 1280;
-    canvas.height = video.videoHeight || 720;
     const context = canvas.getContext('2d');
-    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const scanBox = getScanFrameViewportBox(video, scanFrameRef.current);
+    const crop = mapViewportBoxToVideoCrop(scanBox, video);
+
+    if (crop) {
+      canvas.width = crop.sourceWidth;
+      canvas.height = crop.sourceHeight;
+      context.drawImage(
+        video,
+        crop.sourceLeft,
+        crop.sourceTop,
+        crop.sourceWidth,
+        crop.sourceHeight,
+        0,
+        0,
+        crop.sourceWidth,
+        crop.sourceHeight,
+      );
+    } else {
+      canvas.width = video.videoWidth || 1280;
+      canvas.height = video.videoHeight || 720;
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    }
+
     return canvas.toDataURL('image/jpeg', 0.88);
   }, []);
 
@@ -480,6 +588,16 @@ export function KioskPage({ token, onUnauthorized }) {
         if (nextBox) {
           setFaceBox(nextBox);
         }
+
+        const scanBox = getScanFrameViewportBox(video, scanFrameRef.current);
+        if (!isFaceInsideScanFrame(nextBox, scanBox)) {
+          stableDetectionsRef.current = 0;
+          if (!processingRef.current) {
+            setStage('ready');
+            setStatusText('Move inside the scan box');
+          }
+          return;
+        }
       }
 
       if (
@@ -519,7 +637,17 @@ export function KioskPage({ token, onUnauthorized }) {
         </div>
       )}
 
-      <div className="kiosk-backdrop" />
+      <div className="kiosk-focus-mask" aria-hidden="true">
+        <span className="kiosk-mask-panel kiosk-mask-top-left" />
+        <span className="kiosk-mask-panel kiosk-mask-top" />
+        <span className="kiosk-mask-panel kiosk-mask-top-right" />
+        <span className="kiosk-mask-panel kiosk-mask-left" />
+        <span className="kiosk-mask-panel kiosk-mask-right" />
+        <span className="kiosk-mask-panel kiosk-mask-bottom-left" />
+        <span className="kiosk-mask-panel kiosk-mask-bottom" />
+        <span className="kiosk-mask-panel kiosk-mask-bottom-right" />
+      </div>
+      <div ref={scanFrameRef} className={`kiosk-scan-frame kiosk-scan-frame-${stageConfig.tone}`} aria-hidden="true" />
       <canvas ref={canvasRef} className="hidden-canvas" />
 
       {faceBox ? (
