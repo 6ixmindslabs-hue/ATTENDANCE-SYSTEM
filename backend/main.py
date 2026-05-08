@@ -4,10 +4,11 @@ import os
 import sys
 import zipfile
 from collections import Counter, defaultdict
-from datetime import date, datetime, time as dt_time, timedelta
+from datetime import date, datetime, time as dt_time, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Iterable, Optional
 from xml.sax.saxutils import escape
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
@@ -85,6 +86,29 @@ DEFAULT_SETTINGS = {
     "staff_evening_time_start": dt_time(hour=13, minute=30),
     "staff_evening_time_end": dt_time(hour=16, minute=30),
 }
+DEFAULT_APP_TIMEZONE = "Asia/Kolkata"
+DEFAULT_APP_UTC_OFFSET = timezone(timedelta(hours=5, minutes=30), DEFAULT_APP_TIMEZONE)
+
+
+def get_app_timezone() -> tzinfo:
+    timezone_name = os.getenv("APP_TIMEZONE", DEFAULT_APP_TIMEZONE).strip() or DEFAULT_APP_TIMEZONE
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        if timezone_name != DEFAULT_APP_TIMEZONE:
+            try:
+                return ZoneInfo(DEFAULT_APP_TIMEZONE)
+            except ZoneInfoNotFoundError:
+                pass
+        return DEFAULT_APP_UTC_OFFSET
+
+
+def get_current_datetime() -> datetime:
+    return datetime.now(get_app_timezone()).replace(tzinfo=None)
+
+
+def get_current_date() -> date:
+    return get_current_datetime().date()
 
 allowed_origins = [
     origin.strip()
@@ -627,7 +651,7 @@ def resolve_date_range(
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
 ) -> tuple[date, date]:
-    today = date.today()
+    today = get_current_date()
     resolved_days = days if days is not None else DEFAULT_DASHBOARD_DAYS
 
     if from_date is None and to_date is None:
@@ -751,6 +775,49 @@ def serialize_attendance_window_status(window_status: dict) -> dict:
         "message": window_status["message"],
         "session_name": window_status["session_name"],
     }
+
+
+def resolve_operator_attendance_window(
+    current_datetime: datetime,
+    settings: models.Setting,
+    audiences: Iterable[str],
+    calendar_rules: list[models.CalendarRule],
+    legacy_holiday_dates: Optional[set[date]] = None,
+) -> dict:
+    normalized_audiences = sorted({validate_calendar_audience(audience) for audience in audiences}) or ["students"]
+    audience_statuses = [
+        {
+            **resolve_active_attendance_window(
+                current_datetime,
+                settings,
+                audience,
+                calendar_rules,
+                legacy_holiday_dates,
+            ),
+            "audience": audience,
+        }
+        for audience in normalized_audiences
+    ]
+
+    open_statuses = [status_item for status_item in audience_statuses if status_item["result_code"] == "open"]
+    if len(open_statuses) > 1:
+        return {
+            "result_code": "open",
+            "message": "Attendance is open",
+            "session_name": open_statuses[0]["session_name"],
+        }
+    if open_statuses:
+        return open_statuses[0]
+
+    for result_code in ("between_sessions", "before_window", "day_closed", "attendance_not_conducted", "no_session"):
+        matching_status = next(
+            (status_item for status_item in audience_statuses if status_item["result_code"] == result_code),
+            None,
+        )
+        if matching_status:
+            return matching_status
+
+    return audience_statuses[0]
 
 
 def resolve_session_status(
@@ -1025,6 +1092,20 @@ def get_attendance_operator_users_query(db: Session, current_user: models.User):
     return query
 
 
+def get_attendance_operator_audiences(db: Session, current_user: models.User) -> set[str]:
+    role_rows = (
+        get_attendance_operator_users_query(db, current_user)
+        .with_entities(models.User.role)
+        .distinct()
+        .all()
+    )
+    audiences = {
+        "students" if normalize_role(role_value) == "student" else "staff"
+        for (role_value,) in role_rows
+    }
+    return audiences or {"students"}
+
+
 def get_visible_attendance_query(db: Session, current_user: models.User):
     role = get_effective_role(current_user)
     query = db.query(models.Attendance).join(models.User)
@@ -1085,7 +1166,7 @@ def build_student_summary_map(
     attendance_dates = get_attendance_display_dates(start_date, end_date, audience, calendar_rules, legacy_holiday_dates)
     working_dates = get_working_dates(start_date, end_date, audience, calendar_rules, legacy_holiday_dates)
     records_by_user_date = group_attendance_records_by_user_date(attendance_records)
-    current_datetime = datetime.now()
+    current_datetime = get_current_datetime()
 
     summaries: dict[int, dict] = {}
 
@@ -1267,14 +1348,14 @@ def summarize_faculty_session(rows: list[dict], session_key: str) -> dict:
 
 def get_scope_attendance_history_start(db: Session, student_ids: list[int]) -> date:
     if not student_ids:
-        return date.today()
+        return get_current_date()
 
     earliest_attendance_date = (
         db.query(func.min(models.Attendance.date))
         .filter(models.Attendance.user_id.in_(student_ids))
         .scalar()
     )
-    return earliest_attendance_date or date.today()
+    return earliest_attendance_date or get_current_date()
 
 
 def build_faculty_dashboard_payload(
@@ -1292,7 +1373,7 @@ def build_faculty_dashboard_payload(
         .all()
     )
     student_ids = [student.id for student in students]
-    today = date.today()
+    today = get_current_date()
     history_start = get_scope_attendance_history_start(db, student_ids)
     target_date = min(max(selected_date or today, history_start), today)
 
@@ -1308,7 +1389,7 @@ def build_faculty_dashboard_payload(
             .all()
         )
 
-    current_datetime = datetime.now()
+    current_datetime = get_current_datetime()
     summaries = build_student_summary_map(students, attendance_records, settings, history_start, today, calendar_rules, "students")
     records_by_user_date = group_attendance_records_by_user_date(attendance_records)
     today_rows = build_class_daily_attendance_rows(
@@ -1398,7 +1479,7 @@ def build_faculty_attendance_export(
         .all()
     )
     student_ids = [student.id for student in students]
-    today = date.today()
+    today = get_current_date()
     history_start = get_scope_attendance_history_start(db, student_ids)
 
     resolved_end_date = min(to_date or from_date or today, today)
@@ -1420,7 +1501,7 @@ def build_faculty_attendance_export(
         )
 
     records_by_user_date = group_attendance_records_by_user_date(attendance_records)
-    current_datetime = datetime.now()
+    current_datetime = get_current_datetime()
     workbook_rows: list[list[object]] = [[
         "Date",
         "Register Number",
@@ -1721,7 +1802,7 @@ def build_department_student_daily_attendance(
         "students",
     )
     records_by_user_date = group_attendance_records_by_user_date(attendance_records)
-    current_datetime = datetime.now()
+    current_datetime = get_current_datetime()
     items: list[dict] = []
     attendance_dates = list(reversed(
         get_attendance_display_dates(
@@ -1806,7 +1887,7 @@ def build_department_staff_daily_attendance(
         )
 
     records_by_user_date = group_attendance_records_by_user_date(attendance_records)
-    current_datetime = datetime.now()
+    current_datetime = get_current_datetime()
     items: list[dict] = []
     attendance_dates = list(reversed(
         get_attendance_display_dates(
@@ -2045,7 +2126,7 @@ def build_institute_role_daily_attendance(
         else {}
     )
     records_by_user_date = group_attendance_records_by_user_date(attendance_records)
-    current_datetime = datetime.now()
+    current_datetime = get_current_datetime()
     items: list[dict] = []
     attendance_dates = list(reversed(
         get_attendance_display_dates(
@@ -2286,7 +2367,7 @@ def build_trend_data(
 def build_scope_overview(db: Session, current_user: models.User, days: int = DEFAULT_DASHBOARD_DAYS) -> dict:
     settings = ensure_settings(db)
     calendar_rules = get_calendar_rules(db)
-    end_date = date.today()
+    end_date = get_current_date()
     start_date = end_date - timedelta(days=max(days - 1, 0))
 
     visible_users = get_visible_users_query(db, current_user).order_by(models.User.name.asc()).all()
@@ -2492,9 +2573,9 @@ def build_principal_dashboard_payload(
     settings = ensure_settings(db)
     calendar_rules = get_calendar_rules(db)
     legacy_holiday_dates = get_legacy_holiday_dates(settings)
-    today = date.today()
+    today = get_current_date()
     start_date, end_date = resolve_date_range(days=days)
-    current_datetime = datetime.now()
+    current_datetime = get_current_datetime()
 
     visible_users = get_visible_users_query(db, current_user).order_by(models.User.name.asc()).all()
     students = [user for user in visible_users if normalize_role(user.role) == "student"]
@@ -2780,7 +2861,7 @@ def build_student_attendance_snapshot(
     calendar_rules = get_calendar_rules(db)
     audience = get_attendance_calendar_audience_for_user(user)
     if from_date is None and to_date is None and days is None:
-        end_date = date.today()
+        end_date = get_current_date()
         earliest_attendance_date = (
             db.query(func.min(models.Attendance.date))
             .filter(models.Attendance.user_id == user.id)
@@ -2790,7 +2871,7 @@ def build_student_attendance_snapshot(
     else:
         start_date, end_date = resolve_date_range(days=days, from_date=from_date, to_date=to_date)
 
-    current_datetime = datetime.now()
+    current_datetime = get_current_datetime()
     legacy_holiday_dates = get_legacy_holiday_dates(settings)
     attendance_dates = get_attendance_display_dates(start_date, end_date, audience, calendar_rules, legacy_holiday_dates)
     working_dates = get_working_dates(start_date, end_date, audience, calendar_rules, legacy_holiday_dates)
@@ -3486,7 +3567,8 @@ def read_users(
     settings = ensure_settings(db)
     students = [user_row for user_row in users if normalize_role(user_row.role) == "student"]
     student_ids = [student.id for student in students]
-    date_from = date.today() - timedelta(days=DEFAULT_DASHBOARD_DAYS - 1)
+    today = get_current_date()
+    date_from = today - timedelta(days=DEFAULT_DASHBOARD_DAYS - 1)
     attendance_records = []
     if student_ids:
         attendance_records = (
@@ -3494,7 +3576,7 @@ def read_users(
             .filter(
                 models.Attendance.user_id.in_(student_ids),
                 models.Attendance.date >= date_from,
-                models.Attendance.date <= date.today(),
+                models.Attendance.date <= today,
             )
             .all()
         )
@@ -3503,7 +3585,7 @@ def read_users(
         attendance_records,
         settings,
         date_from,
-        date.today(),
+        today,
         get_calendar_rules(db),
         "students",
     )
@@ -3621,7 +3703,7 @@ def read_dashboard_summary(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_active_user),
 ):
-    today = date.today()
+    today = get_current_date()
     settings = ensure_settings(db)
     visible_users = get_visible_users_query(db, current_user).all()
     students = [user for user in visible_users if normalize_role(user.role) == "student"]
@@ -4413,10 +4495,10 @@ def read_attendance_window_status(
     settings = ensure_settings(db)
     calendar_rules = get_calendar_rules(db)
     legacy_holiday_dates = get_legacy_holiday_dates(settings)
-    window_status = resolve_active_attendance_window(
-        datetime.now(),
+    window_status = resolve_operator_attendance_window(
+        get_current_datetime(),
         settings,
-        "students",
+        get_attendance_operator_audiences(db, current_user),
         calendar_rules,
         legacy_holiday_dates,
     )
@@ -4479,20 +4561,21 @@ def mark_attendance(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(require_attendance_operator),
 ):
-    now = datetime.now()
+    now = get_current_datetime()
     settings = ensure_settings(db)
     calendar_rules = get_calendar_rules(db)
     legacy_holiday_dates = get_legacy_holiday_dates(settings)
-    attendance_window = resolve_active_attendance_window(
-        now,
-        settings,
-        "students",
-        calendar_rules,
-        legacy_holiday_dates,
-    )
     user = get_attendance_operator_users_query(db, current_user).filter(models.User.id == payload.user_id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found in your scope")
+
+    attendance_window = resolve_active_attendance_window(
+        now,
+        settings,
+        get_attendance_calendar_audience_for_user(user),
+        calendar_rules,
+        legacy_holiday_dates,
+    )
 
     if attendance_window["result_code"] != "open":
         return {
